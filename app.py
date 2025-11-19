@@ -263,7 +263,7 @@ CUSTOM_CSS = """
         width: 40px;
         height: 40px;
         border-radius: 50%;
-        background: linear-gradient(135deg, #6c47ff, #8b5cf6);
+        background: #3b82f6;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -272,12 +272,7 @@ CUSTOM_CSS = """
         font-size: 1rem;
         margin: 0;
         cursor: pointer;
-        transition: transform 0.2s;
         flex-shrink: 0;
-    }
-    
-    .user-avatar:hover {
-        transform: scale(1.05);
     }
     
     /* Avatar button styling */
@@ -294,15 +289,14 @@ CUSTOM_CSS = """
         justify-content: center !important;
         font-size: 1rem !important;
         font-weight: 600 !important;
-        background: linear-gradient(135deg, #6c47ff, #8b5cf6) !important;
+        background: #3b82f6 !important;
         color: white !important;
         border: none !important;
         cursor: pointer !important;
-        transition: transform 0.2s !important;
     }
     
     button[key*="avatar_btn"]:hover {
-        transform: scale(1.05) !important;
+        background: #3b82f6 !important;
     }
     
     /* Logout button that appears when avatar is clicked */
