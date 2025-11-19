@@ -9,7 +9,17 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 from apify_client import ApifyClient
-from apify_client._errors import ApifyApiError
+try:
+    from apify_client._errors import ApifyApiError
+except ImportError:
+    try:
+        from apify_client.errors import ApifyApiError
+    except ImportError:
+        # Fallback: use a generic exception if ApifyApiError is not available
+        class ApifyApiError(Exception):
+            def __init__(self, message="Apify API error"):
+                self.message = message
+                super().__init__(self.message)
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
