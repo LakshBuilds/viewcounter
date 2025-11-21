@@ -4,7 +4,7 @@ import textwrap
 import requests
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 import streamlit as st
@@ -726,24 +726,51 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
     if not supabase:
         return False
     
+    # Ignore archived/restricted rows that were flagged during refresh
+    items = [item for item in items if not item.get("skip_supabase_save")]
+    if not items:
+        return True
+    
     try:
-        # Get existing reel IDs to avoid duplicates (check by user to allow same reel for different users)
-        # Note: PostgreSQL converts unquoted identifiers to lowercase, so use lowercase column names
-        existing_response = supabase.table("reels").select("id,shortcode,created_by_user_id").execute()
-        existing_by_user = {}
-        for item in existing_response.data:
-            uid = item.get("created_by_user_id")
-            if uid not in existing_by_user:
-                existing_by_user[uid] = {"ids": set(), "codes": set()}
-            if item.get("id"):
-                existing_by_user[uid]["ids"].add(item.get("id"))
-            if item.get("shortcode"):
-                existing_by_user[uid]["codes"].add(item.get("shortcode"))
+        # Get existing reels for incoming IDs/shortcodes to avoid PK conflicts
+        incoming_ids = [item.get("id") for item in items if item.get("id")]
+        incoming_shortcodes = [
+            item.get("shortCode") or item.get("shortcode")
+            for item in items
+            if item.get("shortCode") or item.get("shortcode")
+        ]
+        
+        existing_by_user: Dict[Optional[str], Dict[str, Set[str]]] = {}
+        global_existing_ids: Set[str] = set()
+        
+        def _accumulate_existing(records: List[Dict[str, Any]]):
+            for record in records or []:
+                uid = record.get("created_by_user_id")
+                reel_id = record.get("id")
+                shortcode = record.get("shortcode")
+                
+                if uid not in existing_by_user:
+                    existing_by_user[uid] = {"ids": set(), "codes": set()}
+                if reel_id:
+                    existing_by_user[uid]["ids"].add(reel_id)
+                    global_existing_ids.add(reel_id)
+                if shortcode:
+                    existing_by_user[uid]["codes"].add(shortcode)
+        
+        if incoming_ids:
+            id_response = supabase.table("reels").select("id,shortcode,created_by_user_id").in_("id", incoming_ids).execute()
+            _accumulate_existing(id_response.data)
+        
+        if incoming_shortcodes:
+            sc_response = supabase.table("reels").select("id,shortcode,created_by_user_id").in_("shortcode", incoming_shortcodes).execute()
+            _accumulate_existing(sc_response.data)
         
         user_existing = existing_by_user.get(user_id, {"ids": set(), "codes": set()})
         
         new_items = []
         for item in items:
+            if item.get("skip_supabase_save"):
+                continue
             reel_id = item.get("id")
             short_code = item.get("shortCode")  # Keep camelCase from API response
             
@@ -781,6 +808,16 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
                         supabase.table("reels").update(update_data).eq("shortcode", short_code).eq("created_by_user_id", user_id).execute()
                     except Exception:
                         pass
+                continue
+            
+            # If another user already saved this reel, update the global record to prevent PK conflicts
+            if reel_id and reel_id in global_existing_ids:
+                try:
+                    conflict_update = convert_keys_to_lowercase(item)
+                    conflict_update["updated_at"] = datetime.utcnow().isoformat()
+                    supabase.table("reels").update(conflict_update).eq("id", reel_id).execute()
+                except Exception:
+                    pass
                 continue
             
             # Add user tracking and timestamps
@@ -993,8 +1030,20 @@ def get_chart_data(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return chart_data
 
 
-def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Refresh reel data while preserving user tracking metadata and payout values."""
+def mark_item_as_archived(item: Dict[str, Any], reason: str, payout_value: float) -> Dict[str, Any]:
+    """Return a copy of the item flagged as archived with contextual info."""
+    archived_item = item.copy()
+    archived_item["payout"] = payout_value
+    archived_item["archived"] = True
+    archived_item["archive_reason"] = reason or "Restricted or archived on Instagram"
+    archived_item["archived_at"] = datetime.utcnow().isoformat()
+    # Prevent archived reels from being resaved to Supabase during this cycle
+    archived_item["skip_supabase_save"] = True
+    return archived_item
+
+
+def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Refresh reel data while preserving user tracking metadata, payouts, and handling archived reels."""
     # First, get existing payout values from Supabase to preserve them
     supabase = get_supabase_client()
     payout_map = {}
@@ -1014,7 +1063,8 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> List[Dict[
         except Exception:
             pass
     
-    updated_items = []
+    updated_items: List[Dict[str, Any]] = []
+    archived_summaries: List[Dict[str, str]] = []
     for item in items:
         url = item.get("url") or item.get("permalink") or item.get("inputUrl")
         reel_id = item.get("id")
@@ -1025,23 +1075,55 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> List[Dict[
             try:
                 new_data = fetch_reel_data(api_token, url)
                 if new_data:
-                    # Preserve user tracking metadata and payout from original item
+                    valid_results: List[Dict[str, Any]] = []
+                    archive_reason: Optional[str] = None
+                    
                     for new_item in new_data:
+                        error_reason = new_item.get("error") or new_item.get("errorDescription")
+                        if error_reason:
+                            archive_reason = new_item.get("errorDescription") or new_item.get("error")
+                            continue
+                        
+                        if not new_item.get("id"):
+                            continue
+                        
+                        # Preserve user tracking metadata and payout from original item
                         new_item["created_by_user_id"] = item.get("created_by_user_id")
                         new_item["created_by_email"] = item.get("created_by_email")
                         new_item["created_by_name"] = item.get("created_by_name")
                         # Preserve payout value
                         new_item["payout"] = existing_payout
-                    updated_items.extend(new_data)
+                        valid_results.append(new_item)
+                    
+                    if valid_results:
+                        updated_items.extend(valid_results)
+                    elif archive_reason:
+                        archived_item = mark_item_as_archived(item, archive_reason, existing_payout)
+                        updated_items.append(archived_item)
+                        archived_summaries.append({
+                            "url": url,
+                            "reason": archive_reason,
+                            "shortcode": item.get("shortCode") or item.get("shortcode") or "unknown"
+                        })
+                    else:
+                        item_copy = item.copy()
+                        item_copy["payout"] = existing_payout
+                        updated_items.append(item_copy)
+                else:
+                    item_copy = item.copy()
+                    item_copy["payout"] = existing_payout
+                    updated_items.append(item_copy)
             except Exception:
                 # If refresh fails, keep original item with payout
-                item["payout"] = existing_payout
-                updated_items.append(item)
+                item_copy = item.copy()
+                item_copy["payout"] = existing_payout
+                updated_items.append(item_copy)
         else:
             # Keep original item with payout
-            item["payout"] = existing_payout
-            updated_items.append(item)
-    return updated_items
+            item_copy = item.copy()
+            item_copy["payout"] = existing_payout
+            updated_items.append(item_copy)
+    return updated_items, archived_summaries
 
 
 def parse_urls_from_text(text: str) -> List[str]:
@@ -1600,6 +1682,16 @@ def main():
             </div>
             """, unsafe_allow_html=True)
         
+        # Surface archived/restricted reels from the most recent refresh
+        archived_summary = st.session_state.get("last_archived_summary", [])
+        if archived_summary:
+            with st.expander(f"⚠️ Archived / Restricted reels ({len(archived_summary)})", expanded=False):
+                for entry in archived_summary:
+                    shortcode = entry.get("shortcode", "unknown")
+                    reason = entry.get("reason", "Restricted on Instagram")
+                    url = entry.get("url", "N/A")
+                    st.markdown(f"- `{shortcode}` → {reason}  \n  {url}")
+
         # Refresh Button
         if st.button("🔄 Refresh All Reels", type="secondary", use_container_width=False):
             if not api_token:
@@ -1607,7 +1699,7 @@ def main():
             else:
                 with st.spinner("Refreshing all reels data…"):
                     try:
-                        updated_items = refresh_all_reels(api_token, st.session_state["sheet_items"])
+                        updated_items, archived_info = refresh_all_reels(api_token, st.session_state["sheet_items"])
                         if updated_items:
                             st.session_state["sheet_items"] = updated_items
                             st.session_state["sheet_rows"] = []
@@ -1619,6 +1711,8 @@ def main():
                                 st.success(f"✅ Refreshed {len(updated_items)} reel(s) and saved to Supabase.")
                             else:
                                 st.success(f"✅ Refreshed {len(updated_items)} reel(s).")
+                            if archived_info:
+                                st.session_state["last_archived_summary"] = archived_info
                             st.rerun()
                     except Exception as exc:
                         st.error(f"Error refreshing: {exc}")
