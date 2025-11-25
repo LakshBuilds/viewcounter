@@ -27,3 +27,5 @@
 - Explained why Clerk errors appeared (missing `.env` values) and how to fix them.
 - Clarified that archived Instagram reels cannot be refreshed because Apify only returns restricted/error responses; the dashboard now keeps prior data and indicates the archived status instead of saving empty rows.
 
+
+

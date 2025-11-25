@@ -3,7 +3,7 @@ import re
 import textwrap
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
@@ -47,6 +47,9 @@ TABLE_FIELDS = [
     ("Published", "timestamp"),
     ("Permalink", "url"),
 ]
+
+SHORTCODE_PATTERN = re.compile(r"/(?:reel|p)/([A-Za-z0-9_-]+)/?")
+ACTOR_FAILURE_MESSAGE = "FailedThe main function"
 
 CUSTOM_CSS = """
 <style>
@@ -677,6 +680,91 @@ def convert_keys_to_lowercase(data: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def normalize_instagram_url(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    return url.split("?")[0].rstrip("/")
+
+
+def extract_shortcode_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    match = SHORTCODE_PATTERN.search(url)
+    return match.group(1) if match else None
+
+
+def append_archived_summary(entry: Dict[str, Any]) -> None:
+    summary = st.session_state.get("last_archived_summary", [])
+    summary.append(entry)
+    st.session_state["last_archived_summary"] = summary
+
+
+def archive_reel_record(reason: str, reel_id: Optional[str] = None, shortcode: Optional[str] = None, url: Optional[str] = None) -> bool:
+    """Mark a reel as archived/failed in Supabase."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    
+    update_data = {
+        "archived": True,
+        "archive_reason": reason or "Apify actor failure",
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "refresh_failed": True,
+        "refresh_failed_reason": reason or "Apify actor failure",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    identifier_column = None
+    identifier_value = None
+    
+    try:
+        if reel_id:
+            identifier_column = "id"
+            identifier_value = reel_id
+        elif shortcode:
+            identifier_column = "shortcode"
+            identifier_value = shortcode
+        elif url:
+            clean_url = normalize_instagram_url(url)
+            resp = supabase.table("reels").select("id,shortcode").eq("url", clean_url).limit(1).execute()
+            if resp.data:
+                identifier_column = "id"
+                identifier_value = resp.data[0].get("id")
+                shortcode = resp.data[0].get("shortcode")
+            else:
+                resp = supabase.table("reels").select("id,shortcode").eq("inputurl", clean_url).limit(1).execute()
+                if resp.data:
+                    identifier_column = "id"
+                    identifier_value = resp.data[0].get("id")
+                    shortcode = resp.data[0].get("shortcode")
+        if not identifier_column or not identifier_value:
+            return False
+        
+        supabase.table("reels").update(update_data).eq(identifier_column, identifier_value).execute()
+        return True
+    except Exception:
+        return False
+
+
+def separate_valid_and_error_results(results: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split Apify results into valid entries and error entries."""
+    valid_items: List[Dict[str, Any]] = []
+    error_entries: List[Dict[str, Any]] = []
+    
+    for item in results:
+        error_reason = item.get("error") or item.get("errorDescription")
+        if error_reason:
+            error_entries.append({
+                "reason": error_reason,
+                "id": item.get("id"),
+                "shortcode": item.get("shortCode") or item.get("shortcode"),
+                "url": item.get("url") or item.get("permalink") or item.get("inputUrl"),
+            })
+        else:
+            valid_items.append(item)
+    return valid_items, error_entries
+
+
 def load_data_from_supabase(user_id: Optional[str] = None) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Load reel data from Supabase. If user_id is provided, load only that user's reels."""
     supabase = get_supabase_client()
@@ -742,6 +830,7 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
         
         existing_by_user: Dict[Optional[str], Dict[str, Set[str]]] = {}
         global_existing_ids: Set[str] = set()
+        global_existing_shortcodes: Set[str] = set()
         
         def _accumulate_existing(records: List[Dict[str, Any]]):
             for record in records or []:
@@ -756,14 +845,17 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
                     global_existing_ids.add(reel_id)
                 if shortcode:
                     existing_by_user[uid]["codes"].add(shortcode)
+                    global_existing_shortcodes.add(shortcode)
         
         if incoming_ids:
-            id_response = supabase.table("reels").select("id,shortcode,created_by_user_id").in_("id", incoming_ids).execute()
+            id_response = supabase.table("reels").select("*").in_("id", incoming_ids).execute()
             _accumulate_existing(id_response.data)
-        
+    
         if incoming_shortcodes:
-            sc_response = supabase.table("reels").select("id,shortcode,created_by_user_id").in_("shortcode", incoming_shortcodes).execute()
-            _accumulate_existing(sc_response.data)
+            missing_shortcodes = [code for code in incoming_shortcodes if code and code not in global_existing_shortcodes]
+            if missing_shortcodes:
+                sc_response = supabase.table("reels").select("*").in_("shortcode", missing_shortcodes).execute()
+                _accumulate_existing(sc_response.data)
         
         user_existing = existing_by_user.get(user_id, {"ids": set(), "codes": set()})
         
@@ -772,7 +864,7 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
             if item.get("skip_supabase_save"):
                 continue
             reel_id = item.get("id")
-            short_code = item.get("shortCode")  # Keep camelCase from API response
+            short_code = item.get("shortCode") or item.get("shortcode")
             
             # Check if this user already has this reel
             if reel_id in user_existing["ids"] or short_code in user_existing["codes"]:
@@ -789,7 +881,7 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
                 
                 # Convert camelCase keys to lowercase for database
                 update_data = convert_keys_to_lowercase(item)
-                update_data["updated_at"] = datetime.utcnow().isoformat()
+                update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
                 
                 # Preserve existing payout value from database
                 if existing_payout is not None:
@@ -814,16 +906,24 @@ def save_data_to_supabase(items: List[Dict[str, Any]], user_id: Optional[str] = 
             if reel_id and reel_id in global_existing_ids:
                 try:
                     conflict_update = convert_keys_to_lowercase(item)
-                    conflict_update["updated_at"] = datetime.utcnow().isoformat()
+                    conflict_update["updated_at"] = datetime.now(timezone.utc).isoformat()
                     supabase.table("reels").update(conflict_update).eq("id", reel_id).execute()
+                except Exception:
+                    pass
+                continue
+            if short_code and short_code in global_existing_shortcodes:
+                try:
+                    conflict_update = convert_keys_to_lowercase(item)
+                    conflict_update["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    supabase.table("reels").update(conflict_update).eq("shortcode", short_code).execute()
                 except Exception:
                     pass
                 continue
             
             # Add user tracking and timestamps
             item_with_metadata = item.copy()
-            item_with_metadata["created_at"] = datetime.utcnow().isoformat()
-            item_with_metadata["updated_at"] = datetime.utcnow().isoformat()
+            item_with_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
+            item_with_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
             
             # Initialize payout to 0 if not present
             if "payout" not in item_with_metadata and "Payout" not in item_with_metadata:
@@ -1036,7 +1136,7 @@ def mark_item_as_archived(item: Dict[str, Any], reason: str, payout_value: float
     archived_item["payout"] = payout_value
     archived_item["archived"] = True
     archived_item["archive_reason"] = reason or "Restricted or archived on Instagram"
-    archived_item["archived_at"] = datetime.utcnow().isoformat()
+    archived_item["archived_at"] = datetime.now(timezone.utc).isoformat()
     # Prevent archived reels from being resaved to Supabase during this cycle
     archived_item["skip_supabase_save"] = True
     return archived_item
@@ -1047,19 +1147,21 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List
     # First, get existing payout values from Supabase to preserve them
     supabase = get_supabase_client()
     payout_map = {}
+    all_items: List[Dict[str, Any]] = []
     if supabase:
         try:
             # Get all reel IDs from current items
             reel_ids = [item.get("id") for item in items if item.get("id")]
             if reel_ids:
                 # Fetch existing payout values from database
-                response = supabase.table("reels").select("id, payout").in_("id", reel_ids).execute()
+                response = supabase.table("reels").select("*").in_("id", reel_ids).execute()
                 if response.data:
                     for db_item in response.data:
                         reel_id = db_item.get("id")
                         payout_val = db_item.get("payout") or db_item.get("Payout") or 0.0
                         if payout_val:
                             payout_map[reel_id] = float(payout_val) if payout_val else 0.0
+                        all_items.append(db_item)
         except Exception:
             pass
     
@@ -1068,6 +1170,7 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List
     for item in items:
         url = item.get("url") or item.get("permalink") or item.get("inputUrl")
         reel_id = item.get("id")
+        short_code = item.get("shortCode") or item.get("shortcode")
         # Get existing payout value (from item or database)
         existing_payout = item.get("payout") or item.get("Payout") or payout_map.get(reel_id, 0.0)
         
@@ -1084,7 +1187,19 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List
                             archive_reason = new_item.get("errorDescription") or new_item.get("error")
                             continue
                         
-                        if not new_item.get("id"):
+                        new_item_id = new_item.get("id")
+                        new_item_shortcode = new_item.get("shortCode") or new_item.get("shortcode")
+                        if not new_item_id and not new_item_shortcode:
+                            continue
+                        
+                        # Only keep entries that correspond to the original reel
+                        matches_original = False
+                        if reel_id and new_item_id == reel_id:
+                            matches_original = True
+                        elif short_code and new_item_shortcode == short_code:
+                            matches_original = True
+                        
+                        if not matches_original:
                             continue
                         
                         # Preserve user tracking metadata and payout from original item
@@ -1098,9 +1213,16 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List
                     if valid_results:
                         updated_items.extend(valid_results)
                     elif archive_reason:
+                        archive_reel_record(
+                            archive_reason,
+                            reel_id=reel_id,
+                            shortcode=short_code,
+                            url=url,
+                        )
                         archived_item = mark_item_as_archived(item, archive_reason, existing_payout)
                         updated_items.append(archived_item)
                         archived_summaries.append({
+                            "id": item.get("id"),
                             "url": url,
                             "reason": archive_reason,
                             "shortcode": item.get("shortCode") or item.get("shortcode") or "unknown"
@@ -1110,14 +1232,41 @@ def refresh_all_reels(api_token: str, items: List[Dict[str, Any]]) -> tuple[List
                         item_copy["payout"] = existing_payout
                         updated_items.append(item_copy)
                 else:
+                    archive_reel_record(
+                        "Apify returned empty data",
+                        reel_id=reel_id,
+                        shortcode=short_code,
+                        url=url,
+                    )
+                    archived_item = mark_item_as_archived(item, "Apify returned empty data", existing_payout)
+                    updated_items.append(archived_item)
+                    archived_summaries.append({
+                        "id": item.get("id"),
+                        "url": url,
+                        "reason": "Apify returned empty data",
+                        "shortcode": short_code or "unknown"
+                    })
+            except Exception as exc:
+                error_message = str(exc)
+                if ACTOR_FAILURE_MESSAGE in error_message:
+                    archive_reel_record(
+                        error_message,
+                        reel_id=reel_id,
+                        shortcode=short_code,
+                        url=url,
+                    )
+                    archived_item = mark_item_as_archived(item, error_message, existing_payout)
+                    updated_items.append(archived_item)
+                    archived_summaries.append({
+                        "id": item.get("id"),
+                        "url": url,
+                        "reason": error_message,
+                        "shortcode": short_code or "unknown",
+                    })
+                else:
                     item_copy = item.copy()
                     item_copy["payout"] = existing_payout
                     updated_items.append(item_copy)
-            except Exception:
-                # If refresh fails, keep original item with payout
-                item_copy = item.copy()
-                item_copy["payout"] = existing_payout
-                updated_items.append(item_copy)
         else:
             # Keep original item with payout
             item_copy = item.copy()
@@ -1267,6 +1416,10 @@ def main():
     if "sheet_rows" not in st.session_state:
         st.session_state["sheet_rows"] = []
         st.session_state["sheet_items"] = []
+        st.session_state["sheet_rows_user"] = []
+        st.session_state["sheet_items_user"] = []
+        st.session_state["sheet_rows_team"] = []
+        st.session_state["sheet_items_team"] = []
     
     # Initialize session state - don't reset if already exists
     if "user" not in st.session_state:
@@ -1351,15 +1504,28 @@ def main():
     
     is_admin = st.session_state.get("is_admin", False)
     
-    # Load user-specific data from Supabase on first run
+    # Initialize storage for user/team datasets
+    for key in [
+        "sheet_rows_user", "sheet_items_user",
+        "sheet_rows_team", "sheet_items_team",
+        "sheet_rows", "sheet_items",
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = []
+    
+    # Load data on first run
     if "data_loaded" not in st.session_state:
         st.session_state["data_loaded"] = True
         st.session_state["last_view_mode"] = "Your Reels"
-        with st.spinner("Loading your reels from Supabase..."):
-            rows, items = load_data_from_supabase(user_id)
-            if rows and items:
-                st.session_state["sheet_rows"] = rows
-                st.session_state["sheet_items"] = items
+        with st.spinner("Loading reels from Supabase..."):
+            rows_user, items_user = load_data_from_supabase(user_id)
+            rows_team, items_team = load_data_from_supabase(None)
+            st.session_state["sheet_rows_user"] = rows_user
+            st.session_state["sheet_items_user"] = items_user
+            st.session_state["sheet_rows_team"] = rows_team
+            st.session_state["sheet_items_team"] = items_team
+            st.session_state["sheet_rows"] = rows_user
+            st.session_state["sheet_items"] = items_user
     
     # Header - Compact with avatar and logout together
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
@@ -1497,23 +1663,32 @@ def main():
         st.info("👆 Add reels to see creator statistics.")
     
     # View Toggle - Show first
-    view_mode = st.radio("View Mode", ["Your Reels", "All Team Reels"], horizontal=True, key="view_mode_radio")
+    last_view = st.session_state.get("last_view_mode", "Your Reels")
+    view_mode = st.radio(
+        "View Mode",
+        ["Your Reels", "All Team Reels"],
+        horizontal=True,
+        index=0 if last_view == "Your Reels" else 1,
+        key="view_mode_radio",
+    )
+    st.session_state["last_view_mode"] = view_mode
     
-    # Reload data based on view mode
-    if view_mode == "All Team Reels":
-        if "last_view_mode" not in st.session_state or st.session_state.get("last_view_mode") != "All Team Reels":
-            st.session_state["last_view_mode"] = "All Team Reels"
-            with st.spinner("Loading all team reels..."):
-                rows, items = load_data_from_supabase()  # Load all reels
-                st.session_state["sheet_rows"] = rows
-                st.session_state["sheet_items"] = items
-    else:
-        if "last_view_mode" not in st.session_state or st.session_state.get("last_view_mode") != "Your Reels":
-            st.session_state["last_view_mode"] = "Your Reels"
+    if view_mode == "Your Reels":
+        if not st.session_state["sheet_rows_user"]:
             with st.spinner("Loading your reels..."):
-                rows, items = load_data_from_supabase(user_id)  # Load user's reels
-                st.session_state["sheet_rows"] = rows
-                st.session_state["sheet_items"] = items
+                rows_user, items_user = load_data_from_supabase(user_id)
+                st.session_state["sheet_rows_user"] = rows_user
+                st.session_state["sheet_items_user"] = items_user
+        st.session_state["sheet_rows"] = st.session_state["sheet_rows_user"]
+        st.session_state["sheet_items"] = st.session_state["sheet_items_user"]
+    else:
+        if not st.session_state["sheet_rows_team"]:
+            with st.spinner("Loading all team reels..."):
+                rows_team, items_team = load_data_from_supabase(None)
+                st.session_state["sheet_rows_team"] = rows_team
+                st.session_state["sheet_items_team"] = items_team
+        st.session_state["sheet_rows"] = st.session_state["sheet_rows_team"]
+        st.session_state["sheet_items"] = st.session_state["sheet_items_team"]
     
     # Import URL Section - Only show in "Your Reels" mode
     if view_mode == "Your Reels":
@@ -1521,14 +1696,14 @@ def main():
         
         with tab1:
             col1, col2 = st.columns([4, 1])
-        with col1:
-            reel_url = st.text_input(
-                "Instagram Reel URL",
-                placeholder="https://www.instagram.com/reel/XXXXXXXXX/",
-                label_visibility="collapsed",
-            )
-        with col2:
-            add_btn = st.button("Add Reel", type="primary", use_container_width=True)
+            with col1:
+                reel_url = st.text_input(
+                    "Instagram Reel URL",
+                    placeholder="https://www.instagram.com/reel/XXXXXXXXX/",
+                    label_visibility="collapsed",
+                )
+            with col2:
+                add_btn = st.button("Add Reel", type="primary", use_container_width=True)
         
         if add_btn:
             if not api_token:
@@ -1540,16 +1715,33 @@ def main():
                     try:
                         results = fetch_reel_data(api_token, reel_url)
                         if results:
-                            # Save to Supabase first with user tracking
-                            if save_data_to_supabase(results, user_id, user_email, user_name):
-                                # Reload data from Supabase to ensure consistency
-                                rows, items = load_data_from_supabase(user_id)
-                                st.session_state["sheet_rows"] = rows
-                                st.session_state["sheet_items"] = items
-                                st.success(f"✅ Added {len(results)} reel(s) to the sheet and saved to Supabase.")
+                            valid_items, error_entries = separate_valid_and_error_results(results)
+                            if valid_items:
+                                if save_data_to_supabase(valid_items, user_id, user_email, user_name):
+                                    rows_user, items_user = load_data_from_supabase(user_id)
+                                    rows_team, items_team = load_data_from_supabase(None)
+                                    st.session_state["sheet_rows_user"] = rows_user
+                                    st.session_state["sheet_items_user"] = items_user
+                                    st.session_state["sheet_rows_team"] = rows_team
+                                    st.session_state["sheet_items_team"] = items_team
+                                    st.session_state["sheet_rows"] = rows_user if view_mode == "Your Reels" else rows_team
+                                    st.session_state["sheet_items"] = items_user if view_mode == "Your Reels" else items_team
+                                    st.success(f"✅ Added {len(valid_items)} reel(s) to the sheet and saved to Supabase.")
+                                else:
+                                    st.warning("✅ Added to sheet but failed to save to Supabase.")
+                                st.rerun()
+                            elif error_entries:
+                                for entry in error_entries:
+                                    archive_reel_record(
+                                        entry.get("reason", "Apify actor failure"),
+                                        reel_id=entry.get("id"),
+                                        shortcode=entry.get("shortcode") or extract_shortcode_from_url(reel_url),
+                                        url=entry.get("url") or reel_url,
+                                    )
+                                    append_archived_summary(entry)
+                                st.warning("Reel appears to be archived/restricted; flagged as archived instead of importing.")
                             else:
-                                st.warning("✅ Added to sheet but failed to save to Supabase.")
-                            st.rerun()
+                                st.warning("No usable data returned. Check the URL or try again later.")
                         else:
                             st.warning("No data returned. Check the URL or try again later.")
                     except ValueError as value_error:
@@ -1557,8 +1749,27 @@ def main():
                     except ApifyApiError as api_error:
                         error_msg = getattr(api_error, 'message', str(api_error))
                         st.error(f"Apify error: {error_msg}")
+                        if ACTOR_FAILURE_MESSAGE in error_msg:
+                            shortcode = extract_shortcode_from_url(reel_url)
+                            archive_reel_record(error_msg, shortcode=shortcode, url=reel_url)
+                            append_archived_summary({
+                                "id": None,
+                                "url": reel_url,
+                                "reason": error_msg,
+                                "shortcode": shortcode or "unknown",
+                            })
                     except Exception as exc:
-                        st.error(f"Unexpected error: {exc}")
+                        error_msg = str(exc)
+                        st.error(f"Unexpected error: {error_msg}")
+                        if ACTOR_FAILURE_MESSAGE in error_msg:
+                            shortcode = extract_shortcode_from_url(reel_url)
+                            archive_reel_record(error_msg, shortcode=shortcode, url=reel_url)
+                            append_archived_summary({
+                                "id": None,
+                                "url": reel_url,
+                                "reason": error_msg,
+                                "shortcode": shortcode or "unknown",
+                            })
         
         with tab2:
             st.markdown("**Paste multiple Instagram reel/post URLs (one per line):**")
@@ -1597,29 +1808,67 @@ def main():
                             try:
                                 results = fetch_reel_data(api_token, url)
                                 if results:
-                                    # Save to Supabase first with user tracking
-                                    if save_data_to_supabase(results, user_id, user_email, user_name):
-                                        # Then add to session state
-                                        new_rows = transform_items(results, len(st.session_state["sheet_rows"]))
-                                        st.session_state["sheet_rows"].extend(new_rows)
-                                        st.session_state["sheet_items"].extend(results)
-                                        success_count += len(results)
-                                    else:
-                                        failed_urls.append(f"{url} - Failed to save to Supabase")
+                                    valid_items, error_entries = separate_valid_and_error_results(results)
+                                    if valid_items:
+                                        if save_data_to_supabase(valid_items, user_id, user_email, user_name):
+                                            new_rows = transform_items(valid_items, len(st.session_state["sheet_rows"]))
+                                            st.session_state["sheet_rows"].extend(new_rows)
+                                            st.session_state["sheet_items"].extend(valid_items)
+                                            success_count += len(valid_items)
+                                        else:
+                                            failed_urls.append(f"{url} - Failed to save to Supabase")
+                                    if error_entries:
+                                        for entry in error_entries:
+                                            archive_reel_record(
+                                                entry.get("reason", "Apify actor failure"),
+                                                reel_id=entry.get("id"),
+                                                shortcode=entry.get("shortcode") or extract_shortcode_from_url(url),
+                                                url=entry.get("url") or url,
+                                            )
+                                            append_archived_summary(entry)
+                                        failed_urls.append(f"{url} - Archived/restricted on Instagram")
+                                    if not valid_items and not error_entries:
+                                        failed_urls.append(url)
                                 else:
                                     failed_urls.append(url)
+                            except ApifyApiError as api_error:
+                                error_msg = getattr(api_error, 'message', str(api_error))
+                                failed_urls.append(f"{url} - {error_msg}")
+                                if ACTOR_FAILURE_MESSAGE in error_msg:
+                                    shortcode = extract_shortcode_from_url(url)
+                                    archive_reel_record(error_msg, shortcode=shortcode, url=url)
+                                    append_archived_summary({
+                                        "id": None,
+                                        "url": url,
+                                        "reason": error_msg,
+                                        "shortcode": shortcode or "unknown",
+                                    })
                             except Exception as exc:
-                                failed_urls.append(f"{url} - {str(exc)}")
+                                error_msg = str(exc)
+                                failed_urls.append(f"{url} - {error_msg}")
+                                if ACTOR_FAILURE_MESSAGE in error_msg:
+                                    shortcode = extract_shortcode_from_url(url)
+                                    archive_reel_record(error_msg, shortcode=shortcode, url=url)
+                                    append_archived_summary({
+                                        "id": None,
+                                        "url": url,
+                                        "reason": error_msg,
+                                        "shortcode": shortcode or "unknown",
+                                    })
                         
                         progress_bar.empty()
                         status_text.empty()
                         
                         if success_count > 0:
-                            # Reload data from Supabase to ensure consistency
                             with st.spinner("Reloading data from Supabase..."):
-                                rows, items = load_data_from_supabase(user_id)
-                                st.session_state["sheet_rows"] = rows
-                                st.session_state["sheet_items"] = items
+                                rows_user, items_user = load_data_from_supabase(user_id)
+                                rows_team, items_team = load_data_from_supabase(None)
+                                st.session_state["sheet_rows_user"] = rows_user
+                                st.session_state["sheet_items_user"] = items_user
+                                st.session_state["sheet_rows_team"] = rows_team
+                                st.session_state["sheet_items_team"] = items_team
+                                st.session_state["sheet_rows"] = rows_user
+                                st.session_state["sheet_items"] = items_user
                             st.success(f"✅ Successfully imported {success_count} reel(s) from {len(urls) - len(failed_urls)} URL(s) and saved to Supabase.")
                         if failed_urls:
                             with st.expander(f"❌ Failed URLs ({len(failed_urls)})", expanded=False):
@@ -1701,17 +1950,40 @@ def main():
                     try:
                         updated_items, archived_info = refresh_all_reels(api_token, st.session_state["sheet_items"])
                         if updated_items:
-                            st.session_state["sheet_items"] = updated_items
-                            st.session_state["sheet_rows"] = []
-                            for idx, item in enumerate(updated_items, start=1):
-                                new_rows = transform_items([item], idx - 1)
-                                st.session_state["sheet_rows"].extend(new_rows)
-                            # Save to Supabase with user tracking
-                            if save_data_to_supabase(updated_items, user_id, user_email, user_name):
+                            save_success = save_data_to_supabase(updated_items, user_id, user_email, user_name)
+                            
+                            if save_success:
+                                rows_personal, items_personal = load_data_from_supabase(user_id)
+                                rows_team, items_team = load_data_from_supabase(None)
+                                
+                                if rows_personal and items_personal:
+                                    st.session_state["sheet_rows_user"] = rows_personal
+                                    st.session_state["sheet_items_user"] = items_personal
+                                if rows_team and items_team:
+                                    st.session_state["sheet_rows_team"] = rows_team
+                                    st.session_state["sheet_items_team"] = items_team
+                                
+                                # Determine which dataset to show based on current view
+                                if view_mode == "Your Reels":
+                                    st.session_state["sheet_rows"] = st.session_state.get("sheet_rows_user", rows_personal or [])
+                                    st.session_state["sheet_items"] = st.session_state.get("sheet_items_user", items_personal or [])
+                                else:
+                                    st.session_state["sheet_rows"] = st.session_state.get("sheet_rows_team", rows_team or [])
+                                    st.session_state["sheet_items"] = st.session_state.get("sheet_items_team", items_team or [])
                                 st.success(f"✅ Refreshed {len(updated_items)} reel(s) and saved to Supabase.")
                             else:
+                                st.session_state["sheet_items"] = updated_items
+                                st.session_state["sheet_rows"] = transform_items(updated_items, 0)
                                 st.success(f"✅ Refreshed {len(updated_items)} reel(s).")
+                            
                             if archived_info:
+                                for archived_entry in archived_info:
+                                    archive_reel_record(
+                                        archived_entry.get("reason", "Apify actor failure"),
+                                        reel_id=archived_entry.get("id"),
+                                        shortcode=archived_entry.get("shortcode"),
+                                        url=archived_entry.get("url"),
+                                    )
                                 st.session_state["last_archived_summary"] = archived_info
                             st.rerun()
                     except Exception as exc:
@@ -1754,6 +2026,12 @@ def main():
         
         if st.session_state["sheet_rows"]:
             sheet_df = pd.DataFrame(st.session_state["sheet_rows"])
+            
+            # Normalize numeric columns to avoid Arrow conversion errors
+            numeric_columns = ["Likes", "Comments", "Views"]
+            for col in numeric_columns:
+                if col in sheet_df.columns:
+                    sheet_df[col] = pd.to_numeric(sheet_df[col], errors="coerce").fillna(0).astype(int)
             
             if view_mode == "Your Reels":
                 # Create table with delete buttons
@@ -1805,7 +2083,7 @@ def main():
                                     st.session_state[last_saved_key] = current_payout_str
                                 
                                 new_payout_str = st.text_input(
-                                    "",
+                                    "Payout Amount",
                                     value=current_payout_str,
                                     key=payout_key,
                                     label_visibility="collapsed",
@@ -1889,9 +2167,14 @@ def main():
                             st.session_state["sheet_items"].pop(row_idx)
                             
                             # Reload from Supabase to ensure consistency
-                            rows, items = load_data_from_supabase(user_id)
-                            st.session_state["sheet_rows"] = rows
-                            st.session_state["sheet_items"] = items
+                            rows_user, items_user = load_data_from_supabase(user_id)
+                            rows_team, items_team = load_data_from_supabase(None)
+                            st.session_state["sheet_rows_user"] = rows_user
+                            st.session_state["sheet_items_user"] = items_user
+                            st.session_state["sheet_rows_team"] = rows_team
+                            st.session_state["sheet_items_team"] = items_team
+                            st.session_state["sheet_rows"] = rows_user if view_mode == "Your Reels" else rows_team
+                            st.session_state["sheet_items"] = items_user if view_mode == "Your Reels" else items_team
                             
                             st.success("✅ Reel deleted!")
                             st.rerun()
